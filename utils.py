@@ -1,0 +1,631 @@
+"""De novo priority plot - core functions.
+
+Curates SMILES, computes the three priority-plot axes (Novelty against ZINC,
+Synthesizability from the SA score, and QED), and builds the interactive 3D
+plot. Extracted from the De_Novo_Priority_Plot notebook so it can be reused by
+the Streamlit app in app.py.
+"""
+
+import base64
+import math
+import os
+import sys
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from io import BytesIO
+
+import numpy as np
+import pandas as pd
+import requests
+
+from rdkit import Chem, DataStructs, RDLogger
+from rdkit.Chem import Draw, QED, RDConfig, rdFingerprintGenerator
+
+from molvs.charge import Reionizer, Uncharger
+from molvs.fragment import LargestFragmentChooser
+from molvs.standardize import Standardizer
+from molvs.tautomer import TautomerCanonicalizer
+
+import plotly.graph_objects as go
+
+RDLogger.DisableLog("rdApp.*")  # Sometimes there are errors that could flood the output.
+
+# sascorer ships inside RDKit's Contrib directory, which is not on sys.path by default.
+_SA_SCORE_DIR = os.path.join(RDConfig.RDContribDir, "SA_Score")
+if _SA_SCORE_DIR not in sys.path:
+    sys.path.append(_SA_SCORE_DIR)
+import sascorer
+
+
+# ---------------------------------------------------------------------------
+# SmallWorld API
+# ---------------------------------------------------------------------------
+
+SW = "https://sw.docking.org/search/view"
+
+# Default ZINC collection queried by every novelty calculation.
+# Another option: "Zinc-All-25Q2-1.6B". Call sw_databases() to list them all.
+DEFAULT_DB = "ZINC20-All-25Q2-1.9B"
+
+
+# ---------------------------------------------------------------------------
+# Curation
+# ---------------------------------------------------------------------------
+
+STANDARDIZER = Standardizer()
+LARGEST_FRAGMENT = LargestFragmentChooser()
+UNCHARGER = Uncharger()
+REIONIZER = Reionizer()
+TAUTOMER_CANONICALIZER = TautomerCanonicalizer()
+
+ALLOWED_ELEMENTS = {"H", "B", "C", "N", "O", "F", "Si", "P", "S", "Se", "Cl", "Br", "I"}
+
+# Rejection codes returned by pretreatment in place of a curated SMILES.
+CURATION_ERRORS = ("Error 1", "Error 2", "Error 3")
+
+
+# ---------------------------------------------------------------------------
+# Descriptors
+# ---------------------------------------------------------------------------
+
+# ECFP4 is Morgan with radius 2; the generator is stateless, so one is enough.
+MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+
+# The Ertl & Schuffenhauer score is defined on a 1-10 scale.
+SA_MIN, SA_MAX = 1.0, 10.0
+
+
+# ---------------------------------------------------------------------------
+# Priority plot
+# ---------------------------------------------------------------------------
+
+# Fallback color when the user does not map an activity column.
+DEFAULT_POINT_COLOR = "#2b7bba"
+
+# The three axes produced by calculate_axis, all on a 0-1 higher-is-better scale.
+DEFAULT_AXES = ("Novelty_Score", "Synthesizability", "QED")
+
+# Continuous scale for a numeric activity column.
+DEFAULT_COLORSCALE = "Viridis"
+
+# Qualitative colors for a categorical activity column; they wrap around when
+# there are more categories than colors.
+CATEGORY_PALETTE = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+
+# Passed to fig.show(): the camera button then downloads a vector SVG.
+PLOT_CONFIG = {
+    "displaylogo": False,
+    "toImageButtonOptions": {"format": "svg", "filename": "denovo_priority_plot"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Input handling
+# ---------------------------------------------------------------------------
+
+def _as_smiles_list(smiles):
+    """Normalize any supported input into (list_of_smiles, was_scalar, index).
+
+    A single SMILES is a str, and a str is iterable: without this check,
+    list("CCO") would silently score three separate atoms instead of one
+    molecule. Series keep their index so the result can be assigned back to
+    the DataFrame it came from.
+    """
+    if isinstance(smiles, str) or smiles is None:
+        return [smiles], True, None
+    if isinstance(smiles, pd.Series):
+        return smiles.tolist(), False, smiles.index
+    if hasattr(smiles, "__iter__"):
+        return list(smiles), False, None
+    return [smiles], True, None  # NaN and other non-iterable scalars
+
+
+# ---------------------------------------------------------------------------
+# Curation
+# ---------------------------------------------------------------------------
+
+def pretreatment(smi):
+    """Standardize one SMILES, or return the code that rejects it.
+
+    Error 1: unparsable. Error 2: contains an element outside ALLOWED_ELEMENTS.
+    Error 3: the standardization pipeline itself raised.
+    """
+    try:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            return "Error 1"
+        mol = STANDARDIZER(mol)
+        mol = LARGEST_FRAGMENT(mol)
+        if {atom.GetSymbol() for atom in mol.GetAtoms()} - ALLOWED_ELEMENTS:
+            return "Error 2"
+        mol = UNCHARGER(mol)
+        mol = REIONIZER(mol)
+        mol = TAUTOMER_CANONICALIZER(mol)
+        return Chem.MolToSmiles(mol)
+    except Exception:
+        return "Error 3"
+
+
+def _inchikey(smiles):
+    """InChIKey of an already curated SMILES, used only to spot duplicates."""
+    return Chem.MolToInchiKey(Chem.MolFromSmiles(smiles))
+
+
+def curate_smiles(df, smiles_col="SMILES", drop_duplicates=True):
+    """Standardize a DataFrame of molecules and report validity / uniqueness.
+
+    Returns (curated_df, stats). The curated structures replace the input
+    column under the name SMILES, and an InChIKey column is added. Rejected
+    molecules are dropped, so the result can be shorter than df.
+    """
+    df = df.copy()
+    df["SMILES_Curated"] = df[smiles_col].apply(pretreatment)
+    n_total = len(df)
+
+    valid = df[~df["SMILES_Curated"].isin(CURATION_ERRORS)].reset_index(drop=True)
+    n_valid = len(valid)
+    valid["InChIKey"] = valid["SMILES_Curated"].apply(_inchikey)
+    n_unique = valid["InChIKey"].nunique()
+
+    validity = n_valid / n_total if n_total else 0
+    uniqueness = n_unique / n_valid if n_valid else 0
+
+    if drop_duplicates:
+        valid = valid.drop_duplicates(subset="InChIKey", keep="first").reset_index(drop=True)
+
+    valid = valid.drop(columns=[smiles_col]).rename(columns={"SMILES_Curated": "SMILES"})
+    return valid, {"validity": validity, "uniqueness": uniqueness, "n_total": n_total,
+                   "n_valid": n_valid, "n_unique": n_unique}
+
+
+# ---------------------------------------------------------------------------
+# SmallWorld API - nearest neighbor lookup in ZINC
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def sw_databases():
+    """List the collections the SmallWorld server currently exposes."""
+    r = requests.get("https://sw.docking.org/search/maps", timeout=60)
+    r.raise_for_status()
+    return {v["name"]: v for v in r.json().values() if v.get("enabled")}
+
+
+def sw_nearest_neighbor(smiles, db=None, dist="0-16", timeout=300):
+    """Return (zinc_id, smiles) of the closest ZINC molecule, or None."""
+    r = requests.get(SW, params={"smi": smiles, "db": db or DEFAULT_DB,
+                                 "fmt": "tsv", "length": 1,
+                                 "top": 1, "dist": dist}, timeout=timeout)
+    r.raise_for_status()
+    lines = r.text.strip().split("\n")[1:]
+    if not lines:
+        return None
+    parts = lines[0].split("\t")[0].split()
+    return (parts[1], parts[0]) if len(parts) >= 2 else None
+
+
+def _fetch_neighbor(smiles, db, dist, timeout):
+    """Look one SMILES up in ZINC, turning any failure into an error record.
+
+    Network-bound, so this step is run sequentially (one request at a time)
+    before any parallel computation starts.
+    """
+    try:
+        neighbor = sw_nearest_neighbor(smiles, db=db, dist=dist, timeout=timeout)
+    except Exception as exc:
+        return {"smiles": smiles, "neighbor_zinc_id": None, "neighbor_smiles": None, "error": str(exc)}
+    if neighbor is None:
+        return {"smiles": smiles, "neighbor_zinc_id": None, "neighbor_smiles": None, "error": "No neighbor found"}
+    zinc_id, ref_smiles = neighbor
+    return {"smiles": smiles, "neighbor_zinc_id": zinc_id, "neighbor_smiles": ref_smiles, "error": None}
+
+
+# ---------------------------------------------------------------------------
+# Fingerprints and ZINC Novelty Score
+# ---------------------------------------------------------------------------
+
+def _tanimoto(smi_query, smi_ref, fingerprint_fn):
+    """Compute the Tanimoto coefficient between two SMILES using the given fingerprint function."""
+    mol_query = Chem.MolFromSmiles(smi_query)
+    mol_ref = Chem.MolFromSmiles(smi_ref)
+    if mol_query is None or mol_ref is None:
+        raise ValueError("Could not parse one of the SMILES strings.")
+    return DataStructs.TanimotoSimilarity(fingerprint_fn(mol_query), fingerprint_fn(mol_ref))
+
+
+def tc_ecfp4(smi_query, smi_ref):
+    """Tanimoto coefficient using ECFP4 (Morgan, radius=2) fingerprints."""
+    return _tanimoto(smi_query, smi_ref, MORGAN_GENERATOR.GetFingerprint)
+
+
+def tc_path(smi_query, smi_ref):
+    """Tanimoto coefficient using RDKit's topological (path-based) fingerprint."""
+    return _tanimoto(smi_query, smi_ref, Chem.RDKFingerprint)
+
+
+def novelty_score(smi_query, smi_ref):
+    """ZINC Novelty Score (ZNS), from 0 (identical) to 1 (fully novel).
+
+    ZNS = 1.0 - (Tc_ecfp4 + Tc_path) / 2. Compares the query molecule against
+    its nearest ZINC reference molecule using both ECFP4 and RDKit path-based
+    fingerprints; higher values mean the query is more novel relative to the
+    ZINC reference. Both Tanimoto coefficients are already in 0-1, so the
+    score needs no further rescaling.
+    """
+    return 1.0 - (tc_ecfp4(smi_query, smi_ref) + tc_path(smi_query, smi_ref)) / 2
+
+
+def _score_pair(record):
+    """Compute the fingerprints and ZNS metric for one query/reference pair.
+
+    Runs in a worker thread. RDKit's C++ fingerprint/Tanimoto routines release
+    the GIL for most of their work, so threads still parallelize this CPU step.
+    """
+    if record["error"] is not None:
+        return {**record, "novelty_score": None}
+    try:
+        return {**record, "novelty_score": novelty_score(record["smiles"], record["neighbor_smiles"])}
+    except Exception as exc:
+        return {**record, "novelty_score": None, "error": str(exc)}
+
+
+def novelty_score_batch(smiles, db=None, dist="0-16", timeout=300, max_workers=None,
+                        progress=None):
+    """Score a batch of SMILES against their nearest ZINC neighbors.
+
+    Accepts a single SMILES, a list, or a pandas Series / DataFrame column, and
+    returns a DataFrame with one row per input SMILES, in input order.
+
+    Runs in two stages:
+      1. Sequential SmallWorld API requests, one nearest-neighbor lookup per SMILES.
+      2. Once all lookups are done, the descriptor (ECFP4 / path fingerprint) and
+         novelty score calculations run in parallel across threads.
+
+    progress : optional callable(done, total) invoked after each API lookup, so
+        a caller (e.g. the Streamlit app) can render a progress bar.
+    """
+    smiles_list, _, _ = _as_smiles_list(smiles)
+
+    # Stage 1: sequential API requests
+    records = []
+    total = len(smiles_list)
+    for i, smi in enumerate(smiles_list, start=1):
+        records.append(_fetch_neighbor(smi, db, dist, timeout))
+        if progress is not None:
+            progress(i, total)
+
+    # Stage 2: parallel descriptor + ZNS calculation. executor.map yields in
+    # input order, so the rows still line up with the input SMILES.
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(_score_pair, records))
+
+    return pd.DataFrame(results)
+
+
+# ---------------------------------------------------------------------------
+# QED and synthetic accessibility
+# ---------------------------------------------------------------------------
+
+def _score_smiles(smiles, score_fn):
+    """Apply a per-molecule scoring function over a scalar or a batch of SMILES.
+
+    Unparsable or missing SMILES score as None instead of raising, so one bad
+    row cannot abort a whole library. Repeated SMILES are computed once.
+    """
+    smiles_list, was_scalar, index = _as_smiles_list(smiles)
+
+    cache = {}
+    scores = []
+    for smi in smiles_list:
+        if smi not in cache:
+            mol = Chem.MolFromSmiles(smi) if isinstance(smi, str) and smi.strip() else None
+            try:
+                cache[smi] = None if mol is None else float(score_fn(mol))
+            except Exception:
+                cache[smi] = None
+        scores.append(cache[smi])
+
+    if was_scalar:
+        return scores[0]
+    if index is not None:
+        return pd.Series(scores, index=index, dtype="float64")
+    return scores
+
+
+def qed_score(smiles):
+    """Quantitative Estimate of Drug-likeness, from 0 (poor) to 1 (drug-like).
+
+    Accepts a single SMILES, a list, or a pandas Series / DataFrame column,
+    and mirrors the input shape: a float for a single SMILES, a Series for a
+    Series, a list otherwise.
+    """
+    return _score_smiles(smiles, QED.qed)
+
+
+def sa_score(smiles):
+    """Ertl & Schuffenhauer synthetic accessibility, from 1 (easy) to 10 (hard).
+
+    See synthesizability for the 0-1 version used as a priority-plot axis.
+    Same input/output contract as qed_score.
+    """
+    return _score_smiles(smiles, sascorer.calculateScore)
+
+
+def _synthesizability(mol):
+    """SA score of one molecule, rescaled to 0-1 and inverted."""
+    scaled = (SA_MAX - sascorer.calculateScore(mol)) / (SA_MAX - SA_MIN)
+    return min(1.0, max(0.0, scaled))  # sascorer can drift slightly outside 1-10
+
+
+def synthesizability(smiles):
+    """SA score rescaled to 0-1 and inverted: higher means easier to synthesize.
+
+    Uses (10 - SA) / 9, which puts synthetic accessibility on the same 0-1,
+    higher-is-better scale as QED, so both axes of the priority plot read in the
+    same direction. Same input/output contract as qed_score.
+    """
+    return _score_smiles(smiles, _synthesizability)
+
+
+# ---------------------------------------------------------------------------
+# Priority plot axes
+# ---------------------------------------------------------------------------
+
+def calculate_axis(df, smiles_col="SMILES", curate=True, drop_duplicates=True,
+                   db=None, dist="0-16", timeout=300,
+                   max_workers=None, keep_neighbor=True, progress=None):
+    """Compute the three priority-plot axes for a DataFrame of molecules.
+
+    Returns a copy of df with the Novelty_Score, Synthesizability and QED
+    columns appended, all three on a 0-1 scale where higher is better. The
+    novelty score is the slow step, since it needs one SmallWorld API call per
+    molecule; QED and synthesizability are local RDKit calculations.
+
+    With curate=True (the default) the molecules go through curate_smiles
+    first, so all three axes describe the standardized structure rather than
+    the raw input.
+
+    progress : optional callable(done, total) forwarded to novelty_score_batch.
+    """
+    out = df.copy()
+
+    if curate:
+        out, _ = curate_smiles(out, smiles_col=smiles_col, drop_duplicates=drop_duplicates)
+        smiles_col = "SMILES"
+
+    novelty = novelty_score_batch(out[smiles_col], db=db, dist=dist,
+                                  timeout=timeout, max_workers=max_workers,
+                                  progress=progress)
+
+    # novelty_score_batch returns a fresh RangeIndex, so align by position
+    # (row order is preserved) rather than by index label.
+    if keep_neighbor:
+        out["Neighbor_ZINC_ID"] = novelty["neighbor_zinc_id"].values
+        out["Neighbor_SMILES"] = novelty["neighbor_smiles"].values
+    out["Novelty_Score"] = novelty["novelty_score"].values
+
+    out["Synthesizability"] = synthesizability(out[smiles_col])
+    out["QED"] = qed_score(out[smiles_col])
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Molecule depictions
+# ---------------------------------------------------------------------------
+
+def _mol_to_data_uri(smiles, size=(230, 190)):
+    """Render one SMILES as a base64 PNG data URI, or "" if it cannot be parsed."""
+    mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) and smiles.strip() else None
+    if mol is None:
+        return ""
+    buffer = BytesIO()
+    Draw.MolToImage(mol, size=size).save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _wrap(text, width=38):
+    """Break a long SMILES so the tooltip does not grow past the plot."""
+    text = str(text)
+    return "<br>".join(text[i:i + width] for i in range(0, len(text), width)) or "-"
+
+
+def _camera_eye(azimuth, elevation, distance=1.9):
+    """Turn azimuth / elevation in degrees into a Plotly scene camera position."""
+    a, e = math.radians(azimuth), math.radians(elevation)
+    return dict(x=distance * math.cos(e) * math.cos(a),
+                y=distance * math.cos(e) * math.sin(a),
+                z=distance * math.sin(e))
+
+
+def _axis_style(title):
+    """Shared styling for the three scene axes."""
+    return dict(title=dict(text=title, font=dict(size=12)),
+                backgroundcolor="#fbfcfd", gridcolor="#dfe4ea",
+                zerolinecolor="#c8d0d9", showbackground=True,
+                tickfont=dict(size=10, color="#52616f"))
+
+
+# ---------------------------------------------------------------------------
+# De novo priority plot
+# ---------------------------------------------------------------------------
+
+def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
+                id_col=None, palette=None, point_size=6, width=820, height=680,
+                azimuth=35.0, elevation=22.0, image_size=(230, 190),
+                title="De novo priority plot", structures=True, axis_kwargs=None):
+    """Interactive 3D scatter of the three priority-plot axes.
+
+    Every molecule is one point in the Novelty / Synthesizability / QED space.
+    Pass the result to plot_with_panel_html() to render it next to a panel that
+    draws whichever molecule is hovered.
+
+    If the default axis columns are not in df yet, they are computed on the fly
+    by calling calculate_axis(df, smiles_col=smiles_col). That step is the slow
+    one - one SmallWorld API request per molecule.
+
+    activity_col : optional column driving the point color. Numeric columns get
+        a continuous scale plus a color bar; anything else is treated as
+        categories, one trace each, and gets a legend.
+    """
+    x_col, y_col, z_col = axes
+    if smiles_col not in df.columns:
+        raise ValueError(f"Column not found in the DataFrame: {smiles_col!r}")
+
+    # Only the standard axes can be reconstructed; a custom set of axis names
+    # says the values come from somewhere calculate_axis knows nothing about.
+    missing_axes = [c for c in axes if c not in df.columns]
+    if missing_axes and tuple(axes) == DEFAULT_AXES:
+        df = calculate_axis(df, smiles_col=smiles_col, **(axis_kwargs or {}))
+        if smiles_col not in df.columns and "SMILES" in df.columns:
+            smiles_col = "SMILES"
+
+    needed = list(axes) + ([activity_col] if activity_col else []) + ([id_col] if id_col else [])
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Columns not found in the DataFrame: {missing}")
+
+    # Molecules without coordinates cannot be placed in the scene at all; the
+    # usual cause is a novelty lookup that failed against the SmallWorld API.
+    data = df.dropna(subset=list(axes)).reset_index(drop=True)
+    if data.empty:
+        raise ValueError("No molecule has all three axis values.")
+
+    labels = data[id_col].astype(str) if id_col else data.index.astype(str)
+    smiles = data[smiles_col].astype(str)
+
+    # One depiction per distinct structure; they are the expensive part here.
+    if structures:
+        depictions = {smi: _mol_to_data_uri(smi, image_size) for smi in smiles.unique()}
+        uris = smiles.map(depictions)
+    else:
+        uris = pd.Series([""] * len(data))
+
+    # customdata carries what the tooltip prints, plus the picture that
+    # the panel swaps in on hover.
+    activity_text = (data[activity_col].astype(str) if activity_col
+                     else pd.Series([""] * len(data)))
+    customdata = np.column_stack([labels, smiles.map(_wrap), activity_text, uris])
+
+    activity_row = f"{activity_col}: %{{customdata[2]}}<br>" if activity_col else ""
+    hovertemplate = (
+        "<b>%{customdata[0]}</b><br>"
+        f"{x_col}: %{{x:.3f}}<br>"
+        f"{y_col}: %{{y:.3f}}<br>"
+        f"{z_col}: %{{z:.3f}}<br>"
+        f"{activity_row}"
+        "<span style='color:#8a94a0'>%{customdata[1]}</span>"
+        "<extra></extra>"
+    )
+
+    marker = dict(size=point_size, opacity=0.85,
+                  line=dict(width=0.5, color="#33404d"))
+    scatter_kwargs = dict(mode="markers", hovertemplate=hovertemplate,
+                          hoverlabel=dict(align="left", bgcolor="white",
+                                          bordercolor="#c8d0d9"))
+
+    traces = []
+    if activity_col is None:
+        traces.append(go.Scatter3d(
+            x=data[x_col], y=data[y_col], z=data[z_col], customdata=customdata,
+            marker={**marker, "color": DEFAULT_POINT_COLOR},
+            showlegend=False, **scatter_kwargs))
+    elif pd.api.types.is_numeric_dtype(data[activity_col]):
+        traces.append(go.Scatter3d(
+            x=data[x_col], y=data[y_col], z=data[z_col], customdata=customdata,
+            marker={**marker,
+                    "color": data[activity_col].astype(float),
+                    "colorscale": palette or DEFAULT_COLORSCALE,
+                    "colorbar": dict(title=dict(text=activity_col, side="right"),
+                                     thickness=14, len=0.6, x=1.02)},
+            showlegend=False, **scatter_kwargs))
+    else:
+        # One trace per category, which is what gives Plotly a clickable legend.
+        categories = data[activity_col].astype(str)
+        factors = sorted(categories.unique())
+        colors = list(palette) if palette else list(CATEGORY_PALETTE)
+        for i, factor in enumerate(factors):
+            mask = (categories == factor).values
+            traces.append(go.Scatter3d(
+                x=data.loc[mask, x_col], y=data.loc[mask, y_col],
+                z=data.loc[mask, z_col], customdata=customdata[mask],
+                name=factor, marker={**marker, "color": colors[i % len(colors)]},
+                **scatter_kwargs))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=dict(text=title, x=0.02, xanchor="left", font=dict(size=15)),
+        width=width, height=height, template="plotly_white",
+        margin=dict(l=0, r=0, t=48, b=0),
+        legend=dict(title=dict(text=activity_col or ""), itemsizing="constant",
+                    yanchor="top", y=0.95, xanchor="left", x=0.98),
+        scene=dict(xaxis=_axis_style(x_col), yaxis=_axis_style(y_col),
+                   zaxis=_axis_style(z_col), aspectmode="cube",
+                   camera=dict(eye=_camera_eye(azimuth, elevation))),
+    )
+    return fig
+
+
+# JS twin of the old Bokeh hover: on plotly_hover, copy the depiction that
+# denovo_plot stored in customdata[3] into the panel next to the plot.
+HOVER_JS = """
+(function() {
+    var plot = document.getElementById("__PLOT_ID__");
+    if (!plot || !plot.on) { return; }
+    plot.on("plotly_hover", function(event) {
+        var panel = document.getElementById("__PANEL_ID__");
+        if (!panel) { return; }
+        var point = event.points[0] || {};
+        var row = point.customdata;
+        if (!row && point.data && point.data.customdata) {
+            row = point.data.customdata[point.pointNumber];
+        }
+        panel.textContent = "";
+        panel.style.display = "block";
+
+        var caption = document.createElement("div");
+        caption.style.cssText = "font-weight:600; margin-bottom:4px; color:#3e4c59;";
+        caption.textContent = row ? row[0] : "no data on this point";
+        panel.appendChild(caption);
+        if (!row || !row[3]) { return; }
+
+        var image = document.createElement("img");
+        image.style.cssText = "display:block; border:1px solid #dfe4ea; border-radius:6px;";
+        image.onerror = function() {
+            image.remove();
+            var note = document.createElement("div");
+            note.style.cssText = "color:#b04a4a; font-size:11px;";
+            note.textContent = "This frontend blocked the depiction.";
+            panel.appendChild(note);
+        };
+        image.src = row[3];
+        panel.appendChild(image);
+    });
+})();
+"""
+
+
+def plot_with_panel_html(fig, image_size=(230, 190), include_plotlyjs="cdn"):
+    """Build the HTML of the figure and the structure panel side by side.
+
+    Returns a self-contained HTML string suitable for embedding with
+    streamlit.components.v1.html. include_plotlyjs="cdn" keeps it small but
+    needs a connection; "inline" embeds plotly.js so it also works offline.
+    """
+    plot_id = "denovo-plot-" + uuid.uuid4().hex[:8]
+    panel_id = plot_id + "-panel"
+    img_width, img_height = image_size
+
+    plot_html = fig.to_html(full_html=False, include_plotlyjs=include_plotlyjs,
+                            div_id=plot_id, config=PLOT_CONFIG,
+                            post_script=HOVER_JS.replace("__PLOT_ID__", plot_id)
+                                                .replace("__PANEL_ID__", panel_id))
+    panel_html = (
+        f"<div id='{panel_id}' style='width:{img_width}px; min-height:{img_height}px;"
+        " display:flex; align-items:center; justify-content:center; color:#8a94a0;"
+        " font:12px Helvetica, Arial, sans-serif; border:1px dashed #dfe4ea;"
+        " border-radius:6px; padding:8px;'>Hover a point</div>"
+    )
+    return ("<div style='display:flex; align-items:center; gap:16px; flex-wrap:wrap;'>"
+            f"<div>{plot_html}</div>{panel_html}</div>")
