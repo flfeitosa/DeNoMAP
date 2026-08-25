@@ -40,12 +40,12 @@ Requires **Python 3.9+**.
 
 ```bash
 # 1. Clone the repository and 
-git clone 
-cd De_novoplot_streamlit
+git clone https://github.com/franciscolucasfo/DeNovo_Priority_Plot.git
+cd DeNovo_Priority_Plot/
 
-# 2. (Recommended) create a virtual environment
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+# 2. Create a environment
+conda create -n denovo_plot python=3.11 -y
+conda activate denovo_plot
 
 # 3. Install the dependencies
 pip install -r requirements.txt
