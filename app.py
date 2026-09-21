@@ -55,6 +55,22 @@ if df.empty:
     st.stop()
 
 st.success(f"Loaded {len(df)} rows and {len(df.columns)} columns.")
+
+# A set this large is painful to score one molecule at a time, so the warning
+# below also pre-checks the clustering box instead of relying on the user to
+# remember. They can still turn it off in the sidebar.
+large_dataset = len(df) > utils.LARGE_DATASET_SIZE
+
+if large_dataset:
+    st.warning(
+        f"**WARNING:** this dataset has {len(df)} compounds. Novelty needs one "
+        f"SmallWorld API request per molecule, so scoring a set this large can "
+        f"take a very long time. **Butina clustering has been enabled "
+        f"automatically** in the sidebar: only one centroid per cluster is sent "
+        f"to the API, which keeps the request count (and the runtime) "
+        f"manageable. Uncheck it there if you really want every molecule scored."
+    )
+
 with st.expander("Preview data", expanded=False):
     st.dataframe(df.head(20), use_container_width=True)
 
@@ -107,6 +123,21 @@ with st.sidebar:
         help="Render a molecule image next to the plot. Turn off for large sets.",
     )
 
+    st.subheader("Clustering")
+    cluster = st.checkbox(
+        "Cluster with Butina and keep centroids", value=large_dataset,
+        help="Group similar molecules and score only one representative "
+             "(the centroid) per cluster, cutting the number of API requests. "
+             f"Checked automatically above {utils.LARGE_DATASET_SIZE} molecules.",
+    )
+    cluster_threshold = st.number_input(
+        "Similarity threshold", min_value=0.0, max_value=1.0,
+        value=utils.DEFAULT_CLUSTER_THRESHOLD, step=0.05, format="%.2f",
+        disabled=not cluster,
+        help="Tanimoto similarity (ECFP4) above which two molecules fall in the "
+             "same cluster. Lower values give fewer, broader clusters.",
+    )
+
     st.subheader("Novelty / SmallWorld")
     try:
         db_names = list(utils.sw_databases().keys())
@@ -126,15 +157,21 @@ with st.sidebar:
 # Cache the expensive axis computation so re-coloring the plot does not re-query
 # the SmallWorld API. Keyed on the actual data plus the parameters that change it.
 @st.cache_data(show_spinner=False)
-def compute_axes(df, smiles_col, curate, drop_duplicates, db, dist, timeout):
-    progress_bar = st.progress(0.0, text="Querying SmallWorld API...")
+def compute_axes(df, smiles_col, curate, drop_duplicates, cluster, cluster_threshold,
+                 db, dist, timeout):
+    progress_bar = st.progress(0.0, text="Starting...")
+
+    def on_curate_progress(done, total):
+        progress_bar.progress(done / total, text=f"Curating SMILES... {done}/{total}")
 
     def on_progress(done, total):
         progress_bar.progress(done / total, text=f"Querying SmallWorld API... {done}/{total}")
 
     result = utils.calculate_axis(
         df, smiles_col=smiles_col, curate=curate, drop_duplicates=drop_duplicates,
+        cluster=cluster, cluster_threshold=float(cluster_threshold),
         db=db, dist=dist, timeout=int(timeout), progress=on_progress,
+        curate_progress=on_curate_progress,
     )
     progress_bar.empty()
     return result
@@ -142,10 +179,16 @@ def compute_axes(df, smiles_col, curate, drop_duplicates, db, dist, timeout):
 
 if st.button("Compute axes and plot", type="primary"):
     n = len(df)
-    with st.spinner(f"Scoring {n} molecule(s)... this queries ZINC once per molecule."):
+    spinner_msg = (
+        f"Clustering {n} molecule(s) and scoring one centroid per cluster..."
+        if cluster else
+        f"Scoring {n} molecule(s)... this queries ZINC once per molecule."
+    )
+    with st.spinner(spinner_msg):
         try:
             st.session_state.result = compute_axes(
-                df, smiles_col, curate, drop_duplicates, db, dist, timeout
+                df, smiles_col, curate, drop_duplicates, cluster, cluster_threshold,
+                db, dist, timeout
             )
         except Exception as exc:
             st.error(f"Failed to compute the axes: {exc}")
@@ -167,10 +210,13 @@ plot_activity_col = activity_col if (activity_col and activity_col in result.col
 
 n_failed = int(result["Novelty_Score"].isna().sum())
 n_ok = int(result["Novelty_Score"].notna().sum())
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Molecules plotted", n_ok)
 c2.metric("Novelty lookup failed", n_failed)
 c3.metric("QED median", f"{result['QED'].median():.3f}")
+if "Cluster_Size" in result.columns:
+    c4.metric("Butina clusters", int(result["Cluster_ID"].nunique()),
+              help="One centroid per cluster was scored instead of every molecule.")
 
 try:
     fig = utils.denovo_plot(

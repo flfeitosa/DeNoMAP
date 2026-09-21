@@ -4,5 +4,4 @@ numpy
 requests
 plotly
 rdkit
-MolVS
 openpyxl

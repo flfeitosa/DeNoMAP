@@ -21,11 +21,8 @@ import requests
 
 from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Chem import Draw, QED, RDConfig, rdFingerprintGenerator
-
-from molvs.charge import Reionizer, Uncharger
-from molvs.fragment import LargestFragmentChooser
-from molvs.standardize import Standardizer
-from molvs.tautomer import TautomerCanonicalizer
+from rdkit.Chem.MolStandardize import rdMolStandardize
+from rdkit.ML.Cluster import Butina
 
 import plotly.graph_objects as go
 
@@ -53,16 +50,24 @@ DEFAULT_DB = "ZINC20-All-25Q2-1.9B"
 # Curation
 # ---------------------------------------------------------------------------
 
-STANDARDIZER = Standardizer()
-LARGEST_FRAGMENT = LargestFragmentChooser()
-UNCHARGER = Uncharger()
-REIONIZER = Reionizer()
-TAUTOMER_CANONICALIZER = TautomerCanonicalizer()
+# RDKit's MolStandardize is a C++ port of MolVS, and the tautomer step is the
+# reason for using it: the MolVS original is pure Python and spends ~40 ms per
+# molecule there, about 6x what this costs. The two do not always pick the same
+# tautomer, so curated structures differ from MolVS output for a minority of
+# molecules.
+LARGEST_FRAGMENT = rdMolStandardize.LargestFragmentChooser()
+UNCHARGER = rdMolStandardize.Uncharger()
+REIONIZER = rdMolStandardize.Reionizer()
+TAUTOMER_CANONICALIZER = rdMolStandardize.TautomerEnumerator()
 
 ALLOWED_ELEMENTS = {"H", "B", "C", "N", "O", "F", "Si", "P", "S", "Se", "Cl", "Br", "I"}
 
 # Rejection codes returned by pretreatment in place of a curated SMILES.
 CURATION_ERRORS = ("Error 1", "Error 2", "Error 3")
+
+# How often pretreatment_batch calls its progress callback. Curation runs at
+# roughly 40 ms per molecule, so this reports about every half second.
+PROGRESS_EVERY = 10
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +79,18 @@ MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=20
 
 # The Ertl & Schuffenhauer score is defined on a 1-10 scale.
 SA_MIN, SA_MAX = 1.0, 10.0
+
+
+# ---------------------------------------------------------------------------
+# Clustering
+# ---------------------------------------------------------------------------
+
+# Tanimoto similarity above which two molecules fall in the same Butina cluster.
+DEFAULT_CLUSTER_THRESHOLD = 0.3
+
+# Above this many molecules the SmallWorld API calls dominate the runtime, so
+# clustering first is strongly recommended. Used by the app to warn the user.
+LARGE_DATASET_SIZE = 500
 
 
 # ---------------------------------------------------------------------------
@@ -136,16 +153,37 @@ def pretreatment(smi):
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
             return "Error 1"
-        mol = STANDARDIZER(mol)
-        mol = LARGEST_FRAGMENT(mol)
+        mol = rdMolStandardize.Cleanup(mol)
+        mol = LARGEST_FRAGMENT.choose(mol)
         if {atom.GetSymbol() for atom in mol.GetAtoms()} - ALLOWED_ELEMENTS:
             return "Error 2"
-        mol = UNCHARGER(mol)
-        mol = REIONIZER(mol)
-        mol = TAUTOMER_CANONICALIZER(mol)
+        mol = UNCHARGER.uncharge(mol)
+        mol = REIONIZER.reionize(mol)
+        mol = TAUTOMER_CANONICALIZER.Canonicalize(mol)
         return Chem.MolToSmiles(mol)
     except Exception:
         return "Error 3"
+
+
+def pretreatment_batch(smiles, progress=None):
+    """Run pretreatment over many SMILES, reporting how far along it is.
+
+    Curation is the slow local step - tautomer canonicalization alone costs
+    about 40 ms per molecule - so a few thousand rows take minutes with no
+    output of their own. The callback is what keeps the caller able to show
+    that it is still working.
+
+    progress : optional callable(done, total).
+    """
+    smiles_list, _, _ = _as_smiles_list(smiles)
+    total = len(smiles_list)
+
+    results = []
+    for done, smi in enumerate(smiles_list, start=1):
+        results.append(pretreatment(smi))
+        if progress is not None and (done % PROGRESS_EVERY == 0 or done == total):
+            progress(done, total)
+    return results
 
 
 def _inchikey(smiles):
@@ -153,7 +191,7 @@ def _inchikey(smiles):
     return Chem.MolToInchiKey(Chem.MolFromSmiles(smiles))
 
 
-def curate_smiles(df, smiles_col="SMILES", drop_duplicates=True):
+def curate_smiles(df, smiles_col="SMILES", drop_duplicates=True, progress=None):
     """Standardize a DataFrame of molecules and report validity / uniqueness.
 
     Returns (curated_df, stats). The curated structures replace the input
@@ -161,7 +199,7 @@ def curate_smiles(df, smiles_col="SMILES", drop_duplicates=True):
     molecules are dropped, so the result can be shorter than df.
     """
     df = df.copy()
-    df["SMILES_Curated"] = df[smiles_col].apply(pretreatment)
+    df["SMILES_Curated"] = pretreatment_batch(df[smiles_col], progress=progress)
     n_total = len(df)
 
     valid = df[~df["SMILES_Curated"].isin(CURATION_ERRORS)].reset_index(drop=True)
@@ -178,6 +216,73 @@ def curate_smiles(df, smiles_col="SMILES", drop_duplicates=True):
     valid = valid.drop(columns=[smiles_col]).rename(columns={"SMILES_Curated": "SMILES"})
     return valid, {"validity": validity, "uniqueness": uniqueness, "n_total": n_total,
                    "n_valid": n_valid, "n_unique": n_unique}
+
+
+# ---------------------------------------------------------------------------
+# Butina clustering
+# ---------------------------------------------------------------------------
+
+def butina_clusters(smiles, similarity_threshold=DEFAULT_CLUSTER_THRESHOLD):
+    """Group molecules with Butina clustering on the ECFP4 Tanimoto distance.
+
+    Returns a list of clusters, each a tuple of positional indices into the
+    input whose first element is the cluster centroid. Molecules that cannot be
+    parsed are left out of every cluster.
+
+    similarity_threshold : Tanimoto similarity above which two molecules land in
+        the same cluster. Butina works on distances, so the cutoff handed to it
+        is 1 - similarity_threshold.
+    """
+    if not 0.0 <= similarity_threshold <= 1.0:
+        raise ValueError("similarity_threshold must be between 0 and 1.")
+
+    smiles_list, _, _ = _as_smiles_list(smiles)
+
+    # Keep the mapping back to the caller's positions: unparsable molecules are
+    # skipped here but the returned indices must still address the input.
+    positions, fingerprints = [], []
+    for position, smi in enumerate(smiles_list):
+        mol = Chem.MolFromSmiles(smi) if isinstance(smi, str) and smi.strip() else None
+        if mol is None:
+            continue
+        positions.append(position)
+        fingerprints.append(MORGAN_GENERATOR.GetFingerprint(mol))
+
+    if not fingerprints:
+        return []
+
+    # Butina expects the lower triangle of the distance matrix, flattened.
+    distances = []
+    for i in range(1, len(fingerprints)):
+        similarities = DataStructs.BulkTanimotoSimilarity(fingerprints[i], fingerprints[:i])
+        distances.extend(1.0 - s for s in similarities)
+
+    clusters = Butina.ClusterData(distances, len(fingerprints),
+                                  1.0 - similarity_threshold, isDistData=True)
+    return [tuple(positions[i] for i in cluster) for cluster in clusters]
+
+
+def cluster_centroids(df, smiles_col="SMILES",
+                      similarity_threshold=DEFAULT_CLUSTER_THRESHOLD):
+    """Reduce a DataFrame to one representative molecule per Butina cluster.
+
+    Returns (centroids_df, stats). Only the centroid row of each cluster is
+    kept, with Cluster_ID and Cluster_Size columns appended, so the result can
+    be scored in place of the full set - one SmallWorld request per cluster
+    instead of one per molecule.
+    """
+    clusters = butina_clusters(df[smiles_col], similarity_threshold=similarity_threshold)
+
+    centroid_positions = [cluster[0] for cluster in clusters]
+    out = df.iloc[centroid_positions].copy()
+    out["Cluster_ID"] = range(len(clusters))
+    out["Cluster_Size"] = [len(cluster) for cluster in clusters]
+    out = out.reset_index(drop=True)
+
+    n_clustered = sum(len(cluster) for cluster in clusters)
+    return out, {"n_total": len(df), "n_clustered": n_clustered,
+                 "n_clusters": len(clusters),
+                 "similarity_threshold": similarity_threshold}
 
 
 # ---------------------------------------------------------------------------
@@ -373,8 +478,10 @@ def synthesizability(smiles):
 # ---------------------------------------------------------------------------
 
 def calculate_axis(df, smiles_col="SMILES", curate=True, drop_duplicates=True,
+                   cluster=False, cluster_threshold=DEFAULT_CLUSTER_THRESHOLD,
                    db=None, dist="0-16", timeout=300,
-                   max_workers=None, keep_neighbor=True, progress=None):
+                   max_workers=None, keep_neighbor=True, progress=None,
+                   curate_progress=None):
     """Compute the three priority-plot axes for a DataFrame of molecules.
 
     Returns a copy of df with the Novelty_Score, Synthesizability and QED
@@ -386,13 +493,25 @@ def calculate_axis(df, smiles_col="SMILES", curate=True, drop_duplicates=True,
     first, so all three axes describe the standardized structure rather than
     the raw input.
 
+    With cluster=True the set is reduced to one Butina centroid per cluster
+    before scoring, which cuts the number of SmallWorld requests down to the
+    number of clusters. cluster_threshold is the Tanimoto similarity above
+    which two molecules share a cluster.
+
     progress : optional callable(done, total) forwarded to novelty_score_batch.
+    curate_progress : optional callable(done, total) for the curation step,
+        which is the slow local one - roughly 40 ms per molecule.
     """
     out = df.copy()
 
     if curate:
-        out, _ = curate_smiles(out, smiles_col=smiles_col, drop_duplicates=drop_duplicates)
+        out, _ = curate_smiles(out, smiles_col=smiles_col, drop_duplicates=drop_duplicates,
+                               progress=curate_progress)
         smiles_col = "SMILES"
+
+    if cluster:
+        out, _ = cluster_centroids(out, smiles_col=smiles_col,
+                                   similarity_threshold=cluster_threshold)
 
     novelty = novelty_score_batch(out[smiles_col], db=db, dist=dist,
                                   timeout=timeout, max_workers=max_workers,
