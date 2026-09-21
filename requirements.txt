@@ -1,7 +1,9 @@
-streamlit
-pandas
-numpy
-requests
-plotly
-rdkit
-openpyxl
+# Pinned to the versions Streamlit Community Cloud resolved on 2026-09-21,
+# under Python 3.11, so a future release cannot silently break the deployment.
+streamlit==1.64.0
+pandas==3.0.6
+numpy==2.4.6
+requests==2.34.2
+plotly==7.1.0
+rdkit==2026.3.6
+openpyxl==3.1.5

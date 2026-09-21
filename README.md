@@ -43,7 +43,9 @@ the molecule structure drawn beside the plot as you hover each point.
 
 ## 💻 Run it locally
 
-Requires **Python 3.9+**.
+Requires **Python 3.11** — the same version the app runs on in Streamlit
+Community Cloud, and what the pinned dependencies in `requirements.txt`
+are resolved against.
 
 ```bash
 # 1. Clone the repository and 
