@@ -6,21 +6,19 @@ plot. Extracted from the De_Novo_Priority_Plot notebook so it can be reused by
 the Streamlit app in app.py.
 """
 
-import base64
 import math
 import os
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-from io import BytesIO
 
 import numpy as np
 import pandas as pd
 import requests
 
 from rdkit import Chem, DataStructs, RDLogger
-from rdkit.Chem import Draw, QED, RDConfig, rdFingerprintGenerator
+from rdkit.Chem import QED, RDConfig, rdFingerprintGenerator
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
 import plotly.graph_objects as go
@@ -605,16 +603,6 @@ def calculate_axis(df, smiles_col="SMILES", curate=True, drop_duplicates=True,
 # Molecule depictions
 # ---------------------------------------------------------------------------
 
-def _mol_to_data_uri(smiles, size=(230, 190)):
-    """Render one SMILES as a base64 PNG data URI, or "" if it cannot be parsed."""
-    mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) and smiles.strip() else None
-    if mol is None:
-        return ""
-    buffer = BytesIO()
-    Draw.MolToImage(mol, size=size).save(buffer, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
 def _wrap(text, width=38):
     """Break a long SMILES so the tooltip does not grow past the plot."""
     text = str(text)
@@ -643,7 +631,7 @@ def _axis_style(title):
 
 def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
                 id_col=None, palette=None, point_size=6, width=820, height=680,
-                azimuth=35.0, elevation=22.0, image_size=(230, 190),
+                azimuth=35.0, elevation=22.0,
                 title="De novo priority plot", structures=True, axis_kwargs=None):
     """Interactive 3D scatter of the three priority-plot axes.
 
@@ -685,18 +673,16 @@ def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
     labels = data[id_col].astype(str) if id_col else data.index.astype(str)
     smiles = data[smiles_col].astype(str)
 
-    # One depiction per distinct structure; they are the expensive part here.
-    if structures:
-        depictions = {smi: _mol_to_data_uri(smi, image_size) for smi in smiles.unique()}
-        uris = smiles.map(depictions)
-    else:
-        uris = pd.Series([""] * len(data))
+    # The panel draws the hovered molecule in the browser, so the point only
+    # has to carry its SMILES.
+    depiction_smiles = smiles if structures else pd.Series([""] * len(data))
 
-    # customdata carries what the tooltip prints, plus the picture that
-    # the panel swaps in on hover.
+    # customdata carries what the tooltip prints, plus the SMILES that
+    # the panel draws on hover.
     activity_text = (data[activity_col].astype(str) if activity_col
                      else pd.Series([""] * len(data)))
-    customdata = np.column_stack([labels, smiles.map(_wrap), activity_text, uris])
+    customdata = np.column_stack([labels, smiles.map(_wrap), activity_text,
+                                  depiction_smiles])
 
     activity_row = f"{activity_col}: %{{customdata[2]}}<br>" if activity_col else ""
     hovertemplate = (
@@ -759,10 +745,33 @@ def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
 
 # JS twin of the old Bokeh hover: on plotly_hover, copy the depiction that
 # denovo_plot stored in customdata[3] into the panel next to the plot.
+# Draws the hovered molecule client-side, so the figure only ever carries
+# SMILES strings. Kept as a classic script tag (not a module) and placed ahead
+# of the plot so SmilesDrawer is defined by the time this runs.
+SMILES_DRAWER_CDN = "https://cdn.jsdelivr.net/npm/smiles-drawer@2.1.7/dist/smiles-drawer.min.js"
+
 HOVER_JS = """
 (function() {
     var plot = document.getElementById("__PLOT_ID__");
     if (!plot || !plot.on) { return; }
+
+    // SmiDrawer draws into an <svg>; the plain Drawer class targets a canvas
+    // through SvgWrapper and throws on one. One drawer serves every hover.
+    var drawer = null;
+    function getDrawer() {
+        if (!drawer && window.SmilesDrawer && window.SmilesDrawer.SmiDrawer) {
+            drawer = new SmilesDrawer.SmiDrawer({width: __IMG_W__, height: __IMG_H__});
+        }
+        return drawer;
+    }
+
+    function note(panel, text) {
+        var el = document.createElement("div");
+        el.style.cssText = "color:#b04a4a; font-size:11px;";
+        el.textContent = text;
+        panel.appendChild(el);
+    }
+
     plot.on("plotly_hover", function(event) {
         var panel = document.getElementById("__PANEL_ID__");
         if (!panel) { return; }
@@ -780,17 +789,26 @@ HOVER_JS = """
         panel.appendChild(caption);
         if (!row || !row[3]) { return; }
 
-        var image = document.createElement("img");
-        image.style.cssText = "display:block; border:1px solid #dfe4ea; border-radius:6px;";
-        image.onerror = function() {
-            image.remove();
-            var note = document.createElement("div");
-            note.style.cssText = "color:#b04a4a; font-size:11px;";
-            note.textContent = "This frontend blocked the depiction.";
-            panel.appendChild(note);
-        };
-        image.src = row[3];
-        panel.appendChild(image);
+        var d = getDrawer();
+        if (!d) { note(panel, "Structure renderer did not load."); return; }
+
+        // createElementNS, not createElement: an HTML <svg> element gets no SVG
+        // behaviour and SmiDrawer silently draws nothing into it.
+        var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.setAttribute("width", __IMG_W__);
+        svg.setAttribute("height", __IMG_H__);
+        svg.style.cssText = "display:block; background:#ffffff; border:1px solid #dfe4ea; border-radius:6px;";
+        panel.appendChild(svg);
+
+        try {
+            d.draw(row[3], svg, "light", null, function(err) {
+                svg.remove();
+                note(panel, "Could not draw this structure.");
+            });
+        } catch (err) {
+            svg.remove();
+            note(panel, "Could not draw this structure.");
+        }
     });
 })();
 """
@@ -810,12 +828,16 @@ def plot_with_panel_html(fig, image_size=(230, 190), include_plotlyjs="cdn"):
     plot_html = fig.to_html(full_html=False, include_plotlyjs=include_plotlyjs,
                             div_id=plot_id, config=PLOT_CONFIG,
                             post_script=HOVER_JS.replace("__PLOT_ID__", plot_id)
-                                                .replace("__PANEL_ID__", panel_id))
+                                                .replace("__PANEL_ID__", panel_id)
+                                                .replace("__IMG_W__", str(img_width))
+                                                .replace("__IMG_H__", str(img_height)))
     panel_html = (
         f"<div id='{panel_id}' style='width:{img_width}px; min-height:{img_height}px;"
+        " background:#ffffff;"
         " display:flex; align-items:center; justify-content:center; color:#8a94a0;"
         " font:12px Helvetica, Arial, sans-serif; border:1px dashed #dfe4ea;"
         " border-radius:6px; padding:8px;'>Hover a point</div>"
     )
-    return ("<div style='display:flex; align-items:center; gap:16px; flex-wrap:wrap;'>"
+    return (f"<script src='{SMILES_DRAWER_CDN}'></script>"
+            "<div style='display:flex; align-items:center; gap:16px; flex-wrap:wrap;'>"
             f"<div>{plot_html}</div>{panel_html}</div>")
