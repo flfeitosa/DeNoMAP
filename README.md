@@ -24,9 +24,10 @@ the molecule structure drawn beside the plot as you hover each point.
 - **Synthesizability** — Ertl & Schuffenhauer SA score, rescaled to 0–1
   (higher = easier to make).
 - **QED** — quantitative estimate of drug-likeness (0–1).
-- **Butina clustering** *(optional)* — groups similar molecules by ECFP4
+- **BitBIRCH clustering** *(optional)* — groups similar molecules by ECFP4
   Tanimoto and scores only the **centroid** of each cluster, cutting the number
-  of API requests to the number of clusters.
+  of API requests to the number of clusters. Linear in the number of molecules,
+  so it stays fast on libraries of tens of thousands.
 - **Interactive 3D plot** — Plotly scatter with a live structure panel on hover.
   Color points by any numeric (color bar) or categorical (legend) activity column.
 - **Export** — download the fully scored dataset as CSV.
@@ -36,7 +37,7 @@ the molecule structure drawn beside the plot as you hover each point.
 > is shown for both the curation and the API steps, and results are cached so
 > re-coloring the plot does not re-query.
 >
-> Above **500 molecules** the app warns you and enables Butina clustering
+> Above **500 molecules** the app warns you and enables BitBIRCH clustering
 > automatically — see [Clustering](#-clustering-large-datasets) below.
 
 ---
@@ -89,18 +90,20 @@ In the app you then choose:
 
 Novelty costs one SmallWorld request per molecule, which is what makes large
 libraries slow. Clustering trades a little resolution for a large reduction in
-requests: molecules are grouped with the **Butina** algorithm on the ECFP4
-Tanimoto distance, and only the **centroid** of each cluster is scored and
-plotted.
+requests: molecules are grouped with the **BitBIRCH** algorithm on the ECFP4
+Tanimoto similarity, and only the **centroid** of each cluster — its medoid,
+a real input molecule — is scored and plotted.
 
 Enable it under **Clustering** in the sidebar:
 
-- **Cluster with Butina and keep centroids** — off by default, but **checked
+- **Cluster with BitBIRCH and keep centroids** — off by default, but **checked
   automatically when the dataset has more than 500 molecules** (you can still
   uncheck it if you really want every molecule scored).
 - **Similarity threshold** — the Tanimoto similarity above which two molecules
-  share a cluster. Default **0.30**. Lower values give fewer, broader clusters
-  and fewer API requests; higher values give more, tighter clusters.
+  share a cluster. Default **0.30**, the value the BitBIRCH authors recommend
+  for ECFP4. Lower values give fewer, broader clusters and fewer API requests;
+  higher values give more, tighter clusters. Worth tuning for your own
+  library, since the number of clusters sets the number of API requests.
 
 The scored output gains two columns, `Cluster_ID` and `Cluster_Size`, so you can
 tell how many molecules each plotted centroid stands for. Clustering runs after
@@ -148,6 +151,6 @@ When clustering is enabled, two extra columns describe the grouping:
 
 | Column         | Meaning                                                  |
 |----------------|----------------------------------------------------------|
-| `Cluster_ID`   | Index of the Butina cluster the centroid represents       |
+| `Cluster_ID`   | Index of the cluster the centroid represents              |
 | `Cluster_Size` | How many molecules that cluster contains                  |
 

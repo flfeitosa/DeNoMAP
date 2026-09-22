@@ -65,7 +65,7 @@ if large_dataset:
     st.warning(
         f"**WARNING:** this dataset has {len(df)} compounds. Novelty needs one "
         f"SmallWorld API request per molecule, so scoring a set this large can "
-        f"take a very long time. **Butina clustering has been enabled "
+        f"take a very long time. **BitBIRCH clustering has been enabled "
         f"automatically** in the sidebar: only one centroid per cluster is sent "
         f"to the API, which keeps the request count (and the runtime) "
         f"manageable. Uncheck it there if you really want every molecule scored."
@@ -125,7 +125,7 @@ with st.sidebar:
 
     st.subheader("Clustering")
     cluster = st.checkbox(
-        "Cluster with Butina and keep centroids", value=large_dataset,
+        "Cluster with BitBIRCH and keep centroids", value=large_dataset,
         help="Group similar molecules and score only one representative "
              "(the centroid) per cluster, cutting the number of API requests. "
              f"Checked automatically above {utils.LARGE_DATASET_SIZE} molecules.",
@@ -135,7 +135,8 @@ with st.sidebar:
         value=utils.DEFAULT_CLUSTER_THRESHOLD, step=0.05, format="%.2f",
         disabled=not cluster,
         help="Tanimoto similarity (ECFP4) above which two molecules fall in the "
-             "same cluster. Lower values give fewer, broader clusters.",
+             "same cluster. Lower values give fewer, broader clusters - and so "
+             "fewer API requests.",
     )
 
     st.subheader("Novelty / SmallWorld")
@@ -164,6 +165,10 @@ def compute_axes(df, smiles_col, curate, drop_duplicates, cluster, cluster_thres
     def on_curate_progress(done, total):
         progress_bar.progress(done / total, text=f"Curating SMILES... {done}/{total}")
 
+    def on_cluster_progress(done, total):
+        progress_bar.progress(done / total,
+                              text=f"Clustering with BitBIRCH... step {done}/{total}")
+
     def on_progress(done, total):
         progress_bar.progress(done / total, text=f"Querying SmallWorld API... {done}/{total}")
 
@@ -171,7 +176,7 @@ def compute_axes(df, smiles_col, curate, drop_duplicates, cluster, cluster_thres
         df, smiles_col=smiles_col, curate=curate, drop_duplicates=drop_duplicates,
         cluster=cluster, cluster_threshold=float(cluster_threshold),
         db=db, dist=dist, timeout=int(timeout), progress=on_progress,
-        curate_progress=on_curate_progress,
+        curate_progress=on_curate_progress, cluster_progress=on_cluster_progress,
     )
     progress_bar.empty()
     return result
@@ -180,7 +185,8 @@ def compute_axes(df, smiles_col, curate, drop_duplicates, cluster, cluster_thres
 if st.button("Compute axes and plot", type="primary"):
     n = len(df)
     spinner_msg = (
-        f"Clustering {n} molecule(s) and scoring one centroid per cluster..."
+        f"Curating, clustering and then scoring {n} molecule(s) - one SmallWorld "
+        f"request per cluster. Watch the progress bar for the current stage."
         if cluster else
         f"Scoring {n} molecule(s)... this queries ZINC once per molecule."
     )
@@ -215,7 +221,7 @@ c1.metric("Molecules plotted", n_ok)
 c2.metric("Novelty lookup failed", n_failed)
 c3.metric("QED median", f"{result['QED'].median():.3f}")
 if "Cluster_Size" in result.columns:
-    c4.metric("Butina clusters", int(result["Cluster_ID"].nunique()),
+    c4.metric("Clusters", int(result["Cluster_ID"].nunique()),
               help="One centroid per cluster was scored instead of every molecule.")
 
 try:

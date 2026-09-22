@@ -7,3 +7,5 @@ requests==2.34.2
 plotly==7.1.0
 rdkit==2026.3.6
 openpyxl==3.1.5
+
+bblean==0.10.3

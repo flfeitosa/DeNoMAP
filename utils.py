@@ -82,8 +82,15 @@ SA_MIN, SA_MAX = 1.0, 10.0
 # Clustering
 # ---------------------------------------------------------------------------
 
-# Tanimoto similarity above which two molecules fall in the same Butina cluster.
+# Tanimoto similarity above which two molecules fall in the same cluster.
+# This is the value the BitBIRCH authors recommend for ECFP4. Lowering it
+# gives broader clusters, and since one SmallWorld request is spent per
+# cluster, it is the knob that sets how long a large run takes.
 DEFAULT_CLUSTER_THRESHOLD = 0.3
+
+# Passed straight to BitBirch. 50 is the value used throughout its paper.
+BITBIRCH_BRANCHING_FACTOR = 50
+BITBIRCH_MERGE_CRITERION = "diameter"
 
 # Above this many molecules the SmallWorld API calls dominate the runtime, so
 # clustering first is strongly recommended. Used by the app to warn the user.
@@ -216,131 +223,93 @@ def curate_smiles(df, smiles_col="SMILES", drop_duplicates=True, progress=None):
 
 
 # ---------------------------------------------------------------------------
-# Butina clustering
+# BitBIRCH clustering
 # ---------------------------------------------------------------------------
 
-def _butina_neighbor_lists(fingerprints, distance_threshold):
-    """Build Butina's neighbor lists without materializing a distance matrix.
-
-    Butina.ClusterData only ever reads the distance matrix to answer "which
-    points are within distance_threshold of point i", but it builds the full
-    N x N float64 array to do so - 3.2 GB at 20k molecules, on top of the
-    flattened lower triangle handed to it. Here each row is compared, reduced
-    to the indices that pass the threshold, and dropped, so peak memory scales
-    with the number of neighbor pairs rather than with N squared.
-
-    Returns one ascending int32 array of neighbor indices per point, each
-    including the point itself, exactly as ClusterData's np.where does.
-    """
-    n = len(fingerprints)
-    heads, tails = [], []
-    for i in range(1, n):
-        # float64 keeps the comparison bit-identical to the 1.0 - s that
-        # ClusterData would have seen for these same pairs.
-        row = 1.0 - np.asarray(
-            DataStructs.BulkTanimotoSimilarity(fingerprints[i], fingerprints[:i]),
-            dtype=np.float64)
-        hits = np.flatnonzero(row <= distance_threshold).astype(np.int32)
-        if hits.size:
-            heads.append(np.full(hits.size, i, dtype=np.int32))
-            tails.append(hits)
-
-    if heads:
-        src, dst = np.concatenate(heads), np.concatenate(tails)
-    else:
-        src = dst = np.empty(0, dtype=np.int32)
-
-    # Only the lower triangle was evaluated, so every pair is added back in
-    # both directions; the diagonal is each point's own zero distance.
-    self_idx = np.arange(n, dtype=np.int32)
-    all_src = np.concatenate([src, dst, self_idx])
-    all_dst = np.concatenate([dst, src, self_idx])
-
-    # lexsort groups by source with neighbors ascending inside each group,
-    # which is the order np.where produced and what fixes cluster membership.
-    order = np.lexsort((all_dst, all_src))
-    all_src, all_dst = all_src[order], all_dst[order]
-    bounds = np.searchsorted(all_src, np.arange(n + 1, dtype=np.int32))
-    return [all_dst[bounds[i]:bounds[i + 1]] for i in range(n)]
-
-
-def butina_clusters(smiles, similarity_threshold=DEFAULT_CLUSTER_THRESHOLD):
-    """Group molecules with Butina clustering on the ECFP4 Tanimoto distance.
+def bitbirch_clusters(smiles, similarity_threshold=DEFAULT_CLUSTER_THRESHOLD,
+                      progress=None):
+    """Group molecules with BitBIRCH on the ECFP4 Tanimoto similarity.
 
     Returns a list of clusters, each a tuple of positional indices into the
-    input whose first element is the cluster centroid. Molecules that cannot be
-    parsed are left out of every cluster.
+    input whose first element is the cluster representative. Molecules that
+    cannot be parsed are left out of every cluster.
 
-    similarity_threshold : Tanimoto similarity above which two molecules land in
-        the same cluster. Butina works on distances, so the cutoff used here is
-        1 - similarity_threshold.
+    BitBIRCH inserts each molecule into a BIRCH tree once rather than comparing
+    every pair, so it stays linear where an all-pairs method does not - the
+    reason it is used here instead of RDKit's Butina.
 
-    The clustering itself is Butina's, reproduced verbatim from
-    rdkit.ML.Cluster.Butina.ClusterData (same greedy pass, same neighbor-count
-    ordering, same output); only the distance bookkeeping differs, so that
-    libraries of tens of thousands of molecules stay within memory.
+    The representative is each cluster's medoid: the real input molecule
+    closest to the cluster's centroid, so it can be scored like any other row.
+
+    Requires the bblean package.
     """
     if not 0.0 <= similarity_threshold <= 1.0:
         raise ValueError("similarity_threshold must be between 0 and 1.")
 
+    try:
+        import bblean
+    except ImportError as exc:  # optional dependency, so say what is missing
+        raise ImportError(
+            "BitBIRCH clustering needs the 'bblean' package: pip install bblean"
+        ) from exc
+
     smiles_list, _, _ = _as_smiles_list(smiles)
 
-    # Keep the mapping back to the caller's positions: unparsable molecules are
-    # skipped here but the returned indices must still address the input.
-    positions, fingerprints = [], []
+    # fps_from_smiles can skip unparsable entries, but then the indices it
+    # returns no longer address the caller's rows. Filter here instead, so
+    # the returned clusters still point at the input positions.
+    positions, valid = [], []
     for position, smi in enumerate(smiles_list):
         mol = Chem.MolFromSmiles(smi) if isinstance(smi, str) and smi.strip() else None
         if mol is None:
             continue
         positions.append(position)
-        fingerprints.append(MORGAN_GENERATOR.GetFingerprint(mol))
+        valid.append(smi)
 
-    if not fingerprints:
+    if not valid:
         return []
 
-    n = len(fingerprints)
-    neighbor_lists = _butina_neighbor_lists(fingerprints, 1.0 - similarity_threshold)
+    if progress is not None:
+        progress(0, 2)
+    fingerprints = bblean.fps_from_smiles(valid, kind="ecfp4", n_features=2048,
+                                          pack=True)
+    if progress is not None:
+        progress(1, 2)
 
-    # Butina's greedy pass: repeatedly take the unassigned point with the most
-    # neighbors as a centroid and claim its still-unassigned neighbors.
-    sorted_indices = [(len(nbrs), idx) for idx, nbrs in enumerate(neighbor_lists)]
-    sorted_indices.sort(reverse=True)
+    tree = bblean.BitBirch(threshold=similarity_threshold,
+                           branching_factor=BITBIRCH_BRANCHING_FACTOR,
+                           merge_criterion=BITBIRCH_MERGE_CRITERION)
+    tree.fit(fingerprints)
+
+    members = tree.get_cluster_mol_ids()
+    # medoid_idxs index into each cluster's own member list, not into the
+    # fingerprint array, so they have to be resolved through it.
+    medoids = tree.get_medoids_mol_ids(fingerprints)["medoid_idxs"]
+    if progress is not None:
+        progress(2, 2)
 
     clusters = []
-    seen = np.zeros(n, dtype=bool)
-    while sorted_indices and sorted_indices[0][0] > 1:
-        _, idx = sorted_indices.pop(0)
-        if seen[idx]:
-            continue
-        cluster = [idx]
-        seen[idx] = True
-        # tolist() converts one row at a time; converting them all up front
-        # would cost more than the int32 arrays it replaces.
-        for neighbor in neighbor_lists[idx].tolist():
-            if not seen[neighbor]:
-                cluster.append(neighbor)
-                seen[neighbor] = True
-        clusters.append(tuple(cluster))
-
-    # Whatever is left forms its own singleton cluster.
-    while sorted_indices:
-        _, idx = sorted_indices.pop(0)
-        if not seen[idx]:
-            clusters.append((idx,))
-
-    return [tuple(positions[i] for i in cluster) for cluster in clusters]
+    for cluster, medoid in zip(members, medoids):
+        cluster = [int(i) for i in cluster]
+        seat = int(medoid)
+        cluster.insert(0, cluster.pop(seat))  # representative goes first
+        clusters.append(tuple(positions[i] for i in cluster))
+    return clusters
 
 
 def cluster_centroids(df, smiles_col="SMILES",
-                      similarity_threshold=DEFAULT_CLUSTER_THRESHOLD):
-    """Reduce a DataFrame to one representative molecule per Butina cluster.
+                      similarity_threshold=DEFAULT_CLUSTER_THRESHOLD,
+                      progress=None):
+    """Reduce a DataFrame to one representative molecule per cluster.
 
     Returns (centroids_df, stats). Only the centroid row of each cluster is
     kept, with Cluster_ID and Cluster_Size columns appended, so the result can
     be scored in place of the full set - one SmallWorld request per cluster
     instead of one per molecule.
     """
-    clusters = butina_clusters(df[smiles_col], similarity_threshold=similarity_threshold)
+    clusters = bitbirch_clusters(df[smiles_col],
+                                 similarity_threshold=similarity_threshold,
+                                 progress=progress)
 
     centroid_positions = [cluster[0] for cluster in clusters]
     out = df.iloc[centroid_positions].copy()
@@ -550,7 +519,7 @@ def calculate_axis(df, smiles_col="SMILES", curate=True, drop_duplicates=True,
                    cluster=False, cluster_threshold=DEFAULT_CLUSTER_THRESHOLD,
                    db=None, dist="0-16", timeout=300,
                    max_workers=None, keep_neighbor=True, progress=None,
-                   curate_progress=None):
+                   curate_progress=None, cluster_progress=None):
     """Compute the three priority-plot axes for a DataFrame of molecules.
 
     Returns a copy of df with the Novelty_Score, Synthesizability and QED
@@ -562,7 +531,7 @@ def calculate_axis(df, smiles_col="SMILES", curate=True, drop_duplicates=True,
     first, so all three axes describe the standardized structure rather than
     the raw input.
 
-    With cluster=True the set is reduced to one Butina centroid per cluster
+    With cluster=True the set is reduced to one centroid per cluster
     before scoring, which cuts the number of SmallWorld requests down to the
     number of clusters. cluster_threshold is the Tanimoto similarity above
     which two molecules share a cluster.
@@ -570,6 +539,8 @@ def calculate_axis(df, smiles_col="SMILES", curate=True, drop_duplicates=True,
     progress : optional callable(done, total) forwarded to novelty_score_batch.
     curate_progress : optional callable(done, total) for the curation step,
         which is the slow local one - roughly 40 ms per molecule.
+    cluster_progress : optional callable(done, total) for the clustering
+        pass, which is quadratic and otherwise reports nothing at all.
     """
     out = df.copy()
 
@@ -580,7 +551,8 @@ def calculate_axis(df, smiles_col="SMILES", curate=True, drop_duplicates=True,
 
     if cluster:
         out, _ = cluster_centroids(out, smiles_col=smiles_col,
-                                   similarity_threshold=cluster_threshold)
+                                   similarity_threshold=cluster_threshold,
+                                   progress=cluster_progress)
 
     novelty = novelty_score_batch(out[smiles_col], db=db, dist=dist,
                                   timeout=timeout, max_workers=max_workers,
