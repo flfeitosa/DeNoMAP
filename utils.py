@@ -22,7 +22,6 @@ import requests
 from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Chem import Draw, QED, RDConfig, rdFingerprintGenerator
 from rdkit.Chem.MolStandardize import rdMolStandardize
-from rdkit.ML.Cluster import Butina
 
 import plotly.graph_objects as go
 
@@ -222,6 +221,51 @@ def curate_smiles(df, smiles_col="SMILES", drop_duplicates=True, progress=None):
 # Butina clustering
 # ---------------------------------------------------------------------------
 
+def _butina_neighbor_lists(fingerprints, distance_threshold):
+    """Build Butina's neighbor lists without materializing a distance matrix.
+
+    Butina.ClusterData only ever reads the distance matrix to answer "which
+    points are within distance_threshold of point i", but it builds the full
+    N x N float64 array to do so - 3.2 GB at 20k molecules, on top of the
+    flattened lower triangle handed to it. Here each row is compared, reduced
+    to the indices that pass the threshold, and dropped, so peak memory scales
+    with the number of neighbor pairs rather than with N squared.
+
+    Returns one ascending int32 array of neighbor indices per point, each
+    including the point itself, exactly as ClusterData's np.where does.
+    """
+    n = len(fingerprints)
+    heads, tails = [], []
+    for i in range(1, n):
+        # float64 keeps the comparison bit-identical to the 1.0 - s that
+        # ClusterData would have seen for these same pairs.
+        row = 1.0 - np.asarray(
+            DataStructs.BulkTanimotoSimilarity(fingerprints[i], fingerprints[:i]),
+            dtype=np.float64)
+        hits = np.flatnonzero(row <= distance_threshold).astype(np.int32)
+        if hits.size:
+            heads.append(np.full(hits.size, i, dtype=np.int32))
+            tails.append(hits)
+
+    if heads:
+        src, dst = np.concatenate(heads), np.concatenate(tails)
+    else:
+        src = dst = np.empty(0, dtype=np.int32)
+
+    # Only the lower triangle was evaluated, so every pair is added back in
+    # both directions; the diagonal is each point's own zero distance.
+    self_idx = np.arange(n, dtype=np.int32)
+    all_src = np.concatenate([src, dst, self_idx])
+    all_dst = np.concatenate([dst, src, self_idx])
+
+    # lexsort groups by source with neighbors ascending inside each group,
+    # which is the order np.where produced and what fixes cluster membership.
+    order = np.lexsort((all_dst, all_src))
+    all_src, all_dst = all_src[order], all_dst[order]
+    bounds = np.searchsorted(all_src, np.arange(n + 1, dtype=np.int32))
+    return [all_dst[bounds[i]:bounds[i + 1]] for i in range(n)]
+
+
 def butina_clusters(smiles, similarity_threshold=DEFAULT_CLUSTER_THRESHOLD):
     """Group molecules with Butina clustering on the ECFP4 Tanimoto distance.
 
@@ -230,8 +274,13 @@ def butina_clusters(smiles, similarity_threshold=DEFAULT_CLUSTER_THRESHOLD):
     parsed are left out of every cluster.
 
     similarity_threshold : Tanimoto similarity above which two molecules land in
-        the same cluster. Butina works on distances, so the cutoff handed to it
-        is 1 - similarity_threshold.
+        the same cluster. Butina works on distances, so the cutoff used here is
+        1 - similarity_threshold.
+
+    The clustering itself is Butina's, reproduced verbatim from
+    rdkit.ML.Cluster.Butina.ClusterData (same greedy pass, same neighbor-count
+    ordering, same output); only the distance bookkeeping differs, so that
+    libraries of tens of thousands of molecules stay within memory.
     """
     if not 0.0 <= similarity_threshold <= 1.0:
         raise ValueError("similarity_threshold must be between 0 and 1.")
@@ -251,14 +300,36 @@ def butina_clusters(smiles, similarity_threshold=DEFAULT_CLUSTER_THRESHOLD):
     if not fingerprints:
         return []
 
-    # Butina expects the lower triangle of the distance matrix, flattened.
-    distances = []
-    for i in range(1, len(fingerprints)):
-        similarities = DataStructs.BulkTanimotoSimilarity(fingerprints[i], fingerprints[:i])
-        distances.extend(1.0 - s for s in similarities)
+    n = len(fingerprints)
+    neighbor_lists = _butina_neighbor_lists(fingerprints, 1.0 - similarity_threshold)
 
-    clusters = Butina.ClusterData(distances, len(fingerprints),
-                                  1.0 - similarity_threshold, isDistData=True)
+    # Butina's greedy pass: repeatedly take the unassigned point with the most
+    # neighbors as a centroid and claim its still-unassigned neighbors.
+    sorted_indices = [(len(nbrs), idx) for idx, nbrs in enumerate(neighbor_lists)]
+    sorted_indices.sort(reverse=True)
+
+    clusters = []
+    seen = np.zeros(n, dtype=bool)
+    while sorted_indices and sorted_indices[0][0] > 1:
+        _, idx = sorted_indices.pop(0)
+        if seen[idx]:
+            continue
+        cluster = [idx]
+        seen[idx] = True
+        # tolist() converts one row at a time; converting them all up front
+        # would cost more than the int32 arrays it replaces.
+        for neighbor in neighbor_lists[idx].tolist():
+            if not seen[neighbor]:
+                cluster.append(neighbor)
+                seen[neighbor] = True
+        clusters.append(tuple(cluster))
+
+    # Whatever is left forms its own singleton cluster.
+    while sorted_indices:
+        _, idx = sorted_indices.pop(0)
+        if not seen[idx]:
+            clusters.append((idx,))
+
     return [tuple(positions[i] for i in cluster) for cluster in clusters]
 
 

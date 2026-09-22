@@ -72,7 +72,7 @@ if large_dataset:
     )
 
 with st.expander("Preview data", expanded=False):
-    st.dataframe(df.head(20), use_container_width=True)
+    st.dataframe(df.head(20), width="stretch")
 
 
 # ---------------------------------------------------------------------------
@@ -244,4 +244,4 @@ st.download_button(
 )
 
 with st.expander("Scored data", expanded=False):
-    st.dataframe(result, use_container_width=True)
+    st.dataframe(result, width="stretch")
