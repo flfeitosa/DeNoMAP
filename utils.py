@@ -117,14 +117,13 @@ DEFAULT_CLUSTER_THRESHOLD = 0.2
 # clusters get so tight that clustering barely cuts the request count.
 MAX_CLUSTER_THRESHOLD = 0.5
 
-# Passed straight to BitBirch. 50 is the value used throughout its paper.
-BITBIRCH_BRANCHING_FACTOR = 50
+# Parameters for the BitBIRCH clustering algorithm.
+BITBIRCH_BRANCHING_FACTOR = 100
 BITBIRCH_MERGE_CRITERION = "diameter"
 
 # Above this many molecules the SmallWorld API calls dominate the runtime, so
 # clustering first is strongly recommended. Used by the app to warn the user.
 LARGE_DATASET_SIZE = 500
-
 
 # ---------------------------------------------------------------------------
 # Priority plot
