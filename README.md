@@ -1,4 +1,4 @@
-# 🧪 De Novo Priority Plot
+# 🧪 DeNoMAP
 
 Interactive web app to prioritize *de novo* generated molecules in a 3D
 **Novelty × Synthesizability × QED** space.
@@ -50,12 +50,12 @@ are resolved against.
 
 ```bash
 # 1. Clone the repository and 
-git clone https://github.com/franciscolucasfo/DeNovo_Priority_Plot.git
-cd DeNovo_Priority_Plot/
+git clone https://github.com/flfeitosa/DeNoMAP.git
+cd DeNoMAP/
 
 # 2. Create a environment
-conda create -n denovo_plot python=3.11 -y
-conda activate denovo_plot
+conda create -n denomap python=3.11 -y
+conda activate denomap
 
 # 3. Install the dependencies
 pip install -r requirements.txt

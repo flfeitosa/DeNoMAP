@@ -1,4 +1,4 @@
-"""Streamlit app for the De Novo Priority Plot.
+"""Streamlit app for DeNoMAP.
 
 The user uploads a dataset, picks the SMILES column and (optionally) an activity
 column, and gets the interactive 3D priority plot with a molecule panel on hover.
@@ -11,9 +11,9 @@ import streamlit as st
 
 import utils
 
-st.set_page_config(page_title="De Novo Priority Plot", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="DeNoMAP", page_icon="🧪", layout="wide")
 
-st.title("🧪 De Novo Priority Plot")
+st.title("🧪 DeNoMAP")
 st.caption(
     "Upload a dataset of molecules, choose the SMILES column and an optional "
     "activity column, and explore them in the Novelty / Synthesizability / QED "

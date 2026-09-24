@@ -1,4 +1,4 @@
-"""De novo priority plot - core functions.
+"""DeNoMAP - core functions.
 
 Curates SMILES, computes the three priority-plot axes (Novelty against ZINC,
 Synthesizability from the SA score, and QED), and builds the interactive 3D
@@ -134,7 +134,7 @@ CATEGORY_PALETTE = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
 # Passed to fig.show(): the camera button then downloads a vector SVG.
 PLOT_CONFIG = {
     "displaylogo": False,
-    "toImageButtonOptions": {"format": "svg", "filename": "denovo_priority_plot"},
+    "toImageButtonOptions": {"format": "svg", "filename": "denomap_plot"},
 }
 
 
@@ -626,7 +626,7 @@ def _axis_style(title):
 def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
                 id_col=None, palette=None, point_size=6, width=820, height=680,
                 azimuth=35.0, elevation=22.0,
-                title="De novo priority plot", structures=True, axis_kwargs=None):
+                title="DeNoMAP", structures=True, axis_kwargs=None):
     """Interactive 3D scatter of the three priority-plot axes.
 
     Every molecule is one point in the Novelty / Synthesizability / QED space.
