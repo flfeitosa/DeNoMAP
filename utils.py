@@ -9,8 +9,9 @@ the Streamlit app in app.py.
 import math
 import os
 import sys
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
 import numpy as np
@@ -41,6 +42,21 @@ SW = "https://sw.docking.org/search/view"
 # Default ZINC collection queried by every novelty calculation.
 # Another option: "Zinc-All-25Q2-1.6B". Call sw_databases() to list them all.
 DEFAULT_DB = "ZINC20-All-25Q2-1.9B"
+
+# Maximum number of SmallWorld requests in flight at once. Kept low so the
+# public server is not flooded.
+SW_MAX_CONCURRENT = 5
+
+# One requests.Session per worker thread: Session is not guaranteed to be
+# thread-safe, but a per-thread one still reuses its HTTPS connection.
+_thread_local = threading.local()
+
+
+def _session():
+    """Return this thread's requests.Session, creating it on first use."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +353,7 @@ def sw_databases():
 
 def sw_nearest_neighbor(smiles, db=None, dist="0-16", timeout=300):
     """Return (zinc_id, smiles) of the closest ZINC molecule, or None."""
-    r = requests.get(SW, params={"smi": smiles, "db": db or DEFAULT_DB,
+    r = _session().get(SW, params={"smi": smiles, "db": db or DEFAULT_DB,
                                  "fmt": "tsv", "length": 1,
                                  "top": 1, "dist": dist}, timeout=timeout)
     r.raise_for_status()
@@ -351,8 +367,8 @@ def sw_nearest_neighbor(smiles, db=None, dist="0-16", timeout=300):
 def _fetch_neighbor(smiles, db, dist, timeout):
     """Look one SMILES up in ZINC, turning any failure into an error record.
 
-    Network-bound, so this step is run sequentially (one request at a time)
-    before any parallel computation starts.
+    Network-bound, so it runs in a small thread pool (SW_MAX_CONCURRENT
+    requests at a time); threads release the GIL while waiting on the network.
     """
     try:
         neighbor = sw_nearest_neighbor(smiles, db=db, dist=dist, timeout=timeout)
@@ -421,7 +437,8 @@ def novelty_score_batch(smiles, db=None, dist="0-16", timeout=300, max_workers=N
     returns a DataFrame with one row per input SMILES, in input order.
 
     Runs in two stages:
-      1. Sequential SmallWorld API requests, one nearest-neighbor lookup per SMILES.
+      1. Concurrent SmallWorld API requests (at most SW_MAX_CONCURRENT at a
+         time), one nearest-neighbor lookup per SMILES.
       2. Once all lookups are done, the descriptor (ECFP4 / path fingerprint) and
          novelty score calculations run in parallel across threads.
 
@@ -430,13 +447,18 @@ def novelty_score_batch(smiles, db=None, dist="0-16", timeout=300, max_workers=N
     """
     smiles_list, _, _ = _as_smiles_list(smiles)
 
-    # Stage 1: sequential API requests
-    records = []
+    # Stage 1: concurrent API requests. Results are slotted back by index so
+    # the rows keep input order; progress is reported from this (the calling)
+    # thread, which Streamlit requires.
     total = len(smiles_list)
-    for i, smi in enumerate(smiles_list, start=1):
-        records.append(_fetch_neighbor(smi, db, dist, timeout))
-        if progress is not None:
-            progress(i, total)
+    records = [None] * total
+    with ThreadPoolExecutor(max_workers=SW_MAX_CONCURRENT) as executor:
+        futures = {executor.submit(_fetch_neighbor, smi, db, dist, timeout): i
+                   for i, smi in enumerate(smiles_list)}
+        for done, future in enumerate(as_completed(futures), start=1):
+            records[futures[future]] = future.result()
+            if progress is not None:
+                progress(done, total)
 
     # Stage 2: parallel descriptor + ZNS calculation. executor.map yields in
     # input order, so the rows still line up with the input SMILES.
