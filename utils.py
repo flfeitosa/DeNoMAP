@@ -148,7 +148,7 @@ CATEGORY_PALETTE = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
 # from this value up to 1 on all three axes.
 DEFAULT_DESIRABILITY = 0.7
 DESIRABILITY_COL = "In_Desirability_Zone"
-DESIRABILITY_COLOR = "#2ca02c"
+DESIRABILITY_COLOR = "#d62728"
 
 # Passed to fig.show(): the camera button then downloads a vector SVG.
 PLOT_CONFIG = {
@@ -703,7 +703,8 @@ def _desirability_traces(thresholds):
         ez += [zs[a], zs[b], None]
     return [go.Scatter3d(x=ex, y=ey, z=ez, mode="lines", hoverinfo="skip",
                          line=dict(color=DESIRABILITY_COLOR, width=4),
-                         name="Desirability zone", showlegend=True)]
+                         name="Desirability zone", showlegend=True,
+                         legend="legend2")]
 
 
 # ---------------------------------------------------------------------------
@@ -827,9 +828,13 @@ def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
     fig.update_layout(
         title=dict(text=title, x=0.02, xanchor="left", font=dict(size=15)),
         width=width, height=height, template="plotly_white",
-        margin=dict(l=0, r=0, t=48, b=0),
+        margin=dict(l=0, r=0, t=48, b=36 if desirability is not None else 0),
         legend=dict(title=dict(text=activity_col or ""), itemsizing="constant",
                     yanchor="top", y=0.95, xanchor="left", x=0.98),
+        # Separate legend for the zone, centered under the scene, so it stays
+        # apart from the activity categories at the top right.
+        legend2=dict(orientation="h", xanchor="center", x=0.5,
+                     yanchor="top", y=0),
         scene=dict(**scene_axes, aspectmode="cube",
                    camera=dict(eye=_camera_eye(azimuth, elevation))),
     )
