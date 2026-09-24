@@ -96,7 +96,7 @@ PROGRESS_EVERY = 10
 # ---------------------------------------------------------------------------
 
 # ECFP4 is Morgan with radius 2; the generator is stateless, so one is enough.
-MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=1024)
 
 # The Ertl & Schuffenhauer score is defined on a 1-10 scale.
 SA_MIN, SA_MAX = 1.0, 10.0
