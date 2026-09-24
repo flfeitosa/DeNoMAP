@@ -131,7 +131,8 @@ with st.sidebar:
              f"Checked automatically above {utils.LARGE_DATASET_SIZE} molecules.",
     )
     cluster_threshold = st.number_input(
-        "Similarity threshold", min_value=0.0, max_value=1.0,
+        "Similarity threshold", min_value=0.0,
+        max_value=utils.MAX_CLUSTER_THRESHOLD,
         value=utils.DEFAULT_CLUSTER_THRESHOLD, step=0.05, format="%.2f",
         disabled=not cluster,
         help="Tanimoto similarity (ECFP4) above which two molecules fall in the "
@@ -149,6 +150,30 @@ with st.sidebar:
         st.caption(f"Could not list collections; using {db}.")
     dist = st.text_input("Distance range (dist)", value="0-16")
     timeout = st.number_input("Request timeout (s)", min_value=10, max_value=600, value=300)
+
+    # Only affects the plot and the exported flag, so applying new thresholds
+    # reuses the cached scores and never re-queries the API. The form holds the
+    # changes back until "Apply" is pressed, so dragging a slider does not
+    # redraw the plot on every step.
+    st.subheader("Desirability zone")
+    with st.form("desirability_form", border=False):
+        show_zone = st.checkbox(
+            "Show desirability zone", value=True,
+            help="Outline a box from the thresholds below up to 1 on "
+                 "every axis, and flag the molecules inside it in the "
+                 f"{utils.DESIRABILITY_COL} column of the CSV.",
+        )
+        zone_thresholds = tuple(
+            st.slider(f"{axis} ≥", min_value=0.0, max_value=1.0,
+                      value=utils.DEFAULT_DESIRABILITY, step=0.05,
+                      key=f"zone_{axis}")
+            for axis in utils.DEFAULT_AXES
+        )
+        st.form_submit_button(
+            "Apply desirability zone", width="stretch",
+            help="Reclassify the molecules with the new thresholds. The scores "
+                 "are not recomputed.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -224,10 +249,18 @@ if "Cluster_Size" in result.columns:
     c4.metric("Clusters", int(result["Cluster_ID"].nunique()),
               help="One centroid per cluster was scored instead of every molecule.")
 
+if show_zone:
+    # Work on a copy so the cached result is never mutated between reruns.
+    result = result.assign(**{utils.DESIRABILITY_COL: utils.desirability_mask(
+        result, zone_thresholds)})
+    st.caption(f"**{int(result[utils.DESIRABILITY_COL].sum())}** of {n_ok} "
+               "plotted molecule(s) fall inside the desirability zone.")
+
 try:
     fig = utils.denovo_plot(
         result, smiles_col=plot_smiles_col, activity_col=plot_activity_col,
         id_col=plot_id_col, structures=structures,
+        desirability=zone_thresholds if show_zone else None,
     )
 except Exception as exc:
     st.error(f"Failed to build the plot: {exc}")

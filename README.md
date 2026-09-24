@@ -100,8 +100,9 @@ Enable it under **Clustering** in the sidebar:
   automatically when the dataset has more than 500 molecules** (you can still
   uncheck it if you really want every molecule scored).
 - **Similarity threshold** — the Tanimoto similarity above which two molecules
-  share a cluster. Default **0.30**, the value the BitBIRCH authors recommend
-  for ECFP4. Lower values give fewer, broader clusters and fewer API requests;
+  share a cluster, from 0 to 0.5. Default **0.20**, a bit below the 0.30 the
+  BitBIRCH authors recommend for ECFP4, which gave better-balanced clusters in
+  practice. Lower values give fewer, broader clusters and fewer API requests;
   higher values give more, tighter clusters. Worth tuning for your own
   library, since the number of clusters sets the number of API requests.
 
@@ -117,11 +118,11 @@ import utils
 
 # One representative per cluster, with Cluster_ID / Cluster_Size appended.
 centroids, stats = utils.cluster_centroids(df, smiles_col="SMILES",
-                                           similarity_threshold=0.3)
+                                           similarity_threshold=0.2)
 
 # Or let calculate_axis do it as part of the pipeline.
 scored = utils.calculate_axis(df, smiles_col="SMILES",
-                              cluster=True, cluster_threshold=0.3)
+                              cluster=True, cluster_threshold=0.2)
 ```
 
 ---

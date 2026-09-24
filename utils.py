@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
@@ -46,6 +47,13 @@ DEFAULT_DB = "ZINC20-All-25Q2-1.9B"
 # Maximum number of SmallWorld requests in flight at once. Kept low so the
 # public server is not flooded.
 SW_MAX_CONCURRENT = 5
+
+# A failed lookup is retried this many times when the failure looks transient
+# (dropped connection, timeout, 429 or 5xx). The wait grows with each attempt:
+# SW_RETRY_DELAY seconds before the first retry, twice that before the second.
+SW_RETRIES = 2
+SW_RETRY_DELAY = 5.0
+SW_RETRY_STATUS = {429, 500, 502, 503, 504}
 
 # One requests.Session per worker thread: Session is not guaranteed to be
 # thread-safe, but a per-thread one still reuses its HTTPS connection.
@@ -99,10 +107,15 @@ SA_MIN, SA_MAX = 1.0, 10.0
 # ---------------------------------------------------------------------------
 
 # Tanimoto similarity above which two molecules fall in the same cluster.
-# This is the value the BitBIRCH authors recommend for ECFP4. Lowering it
-# gives broader clusters, and since one SmallWorld request is spent per
-# cluster, it is the knob that sets how long a large run takes.
-DEFAULT_CLUSTER_THRESHOLD = 0.3
+# Set below the 0.3 the BitBIRCH authors recommend for ECFP4, which gave
+# better-balanced clusters in practice. Lowering it gives broader clusters,
+# and since one SmallWorld request is spent per cluster, it is the knob that
+# sets how long a large run takes.
+DEFAULT_CLUSTER_THRESHOLD = 0.2
+
+# Upper bound of the similarity threshold offered in the app; above it the
+# clusters get so tight that clustering barely cuts the request count.
+MAX_CLUSTER_THRESHOLD = 0.5
 
 # Passed straight to BitBirch. 50 is the value used throughout its paper.
 BITBIRCH_BRANCHING_FACTOR = 50
@@ -130,6 +143,12 @@ DEFAULT_COLORSCALE = "Viridis"
 # there are more categories than colors.
 CATEGORY_PALETTE = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
                     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+
+# Default lower bound of the desirability zone on each axis; the zone runs
+# from this value up to 1 on all three axes.
+DEFAULT_DESIRABILITY = 0.7
+DESIRABILITY_COL = "In_Desirability_Zone"
+DESIRABILITY_COLOR = "#2ca02c"
 
 # Passed to fig.show(): the camera button then downloads a vector SVG.
 PLOT_CONFIG = {
@@ -351,12 +370,30 @@ def sw_databases():
     return {v["name"]: v for v in r.json().values() if v.get("enabled")}
 
 
+def _is_transient(exc):
+    """True for failures worth retrying: network blips and server overload."""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    response = getattr(exc, "response", None)
+    return response is not None and response.status_code in SW_RETRY_STATUS
+
+
 def sw_nearest_neighbor(smiles, db=None, dist="0-16", timeout=300):
-    """Return (zinc_id, smiles) of the closest ZINC molecule, or None."""
-    r = _session().get(SW, params={"smi": smiles, "db": db or DEFAULT_DB,
-                                 "fmt": "tsv", "length": 1,
-                                 "top": 1, "dist": dist}, timeout=timeout)
-    r.raise_for_status()
+    """Return (zinc_id, smiles) of the closest ZINC molecule, or None.
+
+    Transient failures are retried SW_RETRIES times before giving up.
+    """
+    params = {"smi": smiles, "db": db or DEFAULT_DB, "fmt": "tsv",
+              "length": 1, "top": 1, "dist": dist}
+    for attempt in range(SW_RETRIES + 1):
+        try:
+            r = _session().get(SW, params=params, timeout=timeout)
+            r.raise_for_status()
+            break
+        except requests.RequestException as exc:
+            if attempt == SW_RETRIES or not _is_transient(exc):
+                raise
+            time.sleep(SW_RETRY_DELAY * (attempt + 1))
     lines = r.text.strip().split("\n")[1:]
     if not lines:
         return None
@@ -620,13 +657,64 @@ def _axis_style(title):
 
 
 # ---------------------------------------------------------------------------
+# Desirability zone
+# ---------------------------------------------------------------------------
+
+def _as_thresholds(thresholds):
+    """Accept one number for all axes or one per axis; return three floats."""
+    if np.isscalar(thresholds):
+        return (float(thresholds),) * 3
+    thresholds = tuple(float(t) for t in thresholds)
+    if len(thresholds) != 3:
+        raise ValueError("Pass one desirability threshold or exactly three.")
+    return thresholds
+
+
+def desirability_mask(df, thresholds=DEFAULT_DESIRABILITY, axes=DEFAULT_AXES):
+    """Boolean Series: True where every axis is at or above its threshold.
+
+    Molecules missing any axis value (e.g. a failed novelty lookup) are False.
+    """
+    mask = pd.Series(True, index=df.index)
+    for col, t in zip(axes, _as_thresholds(thresholds)):
+        mask &= df[col].ge(t).fillna(False)
+    return mask
+
+
+def _desirability_traces(thresholds):
+    """Wireframe box from the thresholds up to 1 on every axis.
+
+    Only the edges are drawn: in a 3D scene every surface, even one with
+    hoverinfo="skip", is written to the WebGL pick buffer and blocks the hover
+    of the points behind it, so a shaded Mesh3d would hide the molecules
+    inside the zone from the tooltip and the structure panel.
+    """
+    (x0, y0, z0), (x1, y1, z1) = _as_thresholds(thresholds), (1.0, 1.0, 1.0)
+    xs = [x0, x1, x1, x0, x0, x1, x1, x0]
+    ys = [y0, y0, y1, y1, y0, y0, y1, y1]
+    zs = [z0, z0, z0, z0, z1, z1, z1, z1]
+    # Trace the 12 edges as one polyline; None breaks the line between them.
+    edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+             (0, 4), (1, 5), (2, 6), (3, 7)]
+    ex, ey, ez = [], [], []
+    for a, b in edges:
+        ex += [xs[a], xs[b], None]
+        ey += [ys[a], ys[b], None]
+        ez += [zs[a], zs[b], None]
+    return [go.Scatter3d(x=ex, y=ey, z=ez, mode="lines", hoverinfo="skip",
+                         line=dict(color=DESIRABILITY_COLOR, width=4),
+                         name="Desirability zone", showlegend=True)]
+
+
+# ---------------------------------------------------------------------------
 # De novo priority plot
 # ---------------------------------------------------------------------------
 
 def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
-                id_col=None, palette=None, point_size=6, width=820, height=680,
+                id_col=None, palette=None, point_size=5, width=820, height=680,
                 azimuth=35.0, elevation=22.0,
-                title="DeNoMAP", structures=True, axis_kwargs=None):
+                title="DeNoMAP", structures=True, axis_kwargs=None,
+                desirability=None):
     """Interactive 3D scatter of the three priority-plot axes.
 
     Every molecule is one point in the Novelty / Synthesizability / QED space.
@@ -640,6 +728,9 @@ def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
     activity_col : optional column driving the point color. Numeric columns get
         a continuous scale plus a color bar; anything else is treated as
         categories, one trace each, and gets a legend.
+    desirability : optional threshold (one for all axes, or one per axis). Draws
+        a wireframe box from the thresholds up to 1 on every axis and fixes
+        the axis ranges to 0-1 so the box keeps its true proportions.
     """
     x_col, y_col, z_col = axes
     if smiles_col not in df.columns:
@@ -723,6 +814,15 @@ def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
                 name=factor, marker={**marker, "color": colors[i % len(colors)]},
                 **scatter_kwargs))
 
+    scene_axes = dict(xaxis=_axis_style(x_col), yaxis=_axis_style(y_col),
+                      zaxis=_axis_style(z_col))
+    if desirability is not None:
+        traces.extend(_desirability_traces(desirability))
+        # Pin every axis to the same 0-1 span; with autoscaled axes each one
+        # stretches differently and the box no longer looks like a box.
+        for ax in scene_axes.values():
+            ax["range"] = [0, 1]
+
     fig = go.Figure(traces)
     fig.update_layout(
         title=dict(text=title, x=0.02, xanchor="left", font=dict(size=15)),
@@ -730,8 +830,7 @@ def denovo_plot(df, smiles_col, activity_col=None, axes=DEFAULT_AXES,
         margin=dict(l=0, r=0, t=48, b=0),
         legend=dict(title=dict(text=activity_col or ""), itemsizing="constant",
                     yanchor="top", y=0.95, xanchor="left", x=0.98),
-        scene=dict(xaxis=_axis_style(x_col), yaxis=_axis_style(y_col),
-                   zaxis=_axis_style(z_col), aspectmode="cube",
+        scene=dict(**scene_axes, aspectmode="cube",
                    camera=dict(eye=_camera_eye(azimuth, elevation))),
     )
     return fig
